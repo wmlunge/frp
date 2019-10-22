@@ -17,44 +17,46 @@ package msg
 import "net"
 
 const (
-	TypeLogin              = 'o'
-	TypeLoginResp          = '1'
-	TypeNewProxy           = 'p'
-	TypeNewProxyResp       = '2'
-	TypeCloseProxy         = 'c'
-	TypeNewWorkConn        = 'w'
-	TypeReqWorkConn        = 'r'
-	TypeStartWorkConn      = 's'
-	TypeNewVisitorConn     = 'v'
-	TypeNewVisitorConnResp = '3'
-	TypePing               = 'h'
-	TypePong               = '4'
-	TypeUdpPacket          = 'u'
-	TypeNatHoleVisitor     = 'i'
-	TypeNatHoleClient      = 'n'
-	TypeNatHoleResp        = 'm'
-	TypeNatHoleSid         = '5'
+	TypeLogin                 = 'o'
+	TypeLoginResp             = '1'
+	TypeNewProxy              = 'p'
+	TypeNewProxyResp          = '2'
+	TypeCloseProxy            = 'c'
+	TypeNewWorkConn           = 'w'
+	TypeReqWorkConn           = 'r'
+	TypeStartWorkConn         = 's'
+	TypeNewVisitorConn        = 'v'
+	TypeNewVisitorConnResp    = '3'
+	TypePing                  = 'h'
+	TypePong                  = '4'
+	TypeUdpPacket             = 'u'
+	TypeNatHoleVisitor        = 'i'
+	TypeNatHoleClient         = 'n'
+	TypeNatHoleResp           = 'm'
+	TypeNatHoleClientDetectOK = 'd'
+	TypeNatHoleSid            = '5'
 )
 
 var (
 	msgTypeMap = map[byte]interface{}{
-		TypeLogin:              Login{},
-		TypeLoginResp:          LoginResp{},
-		TypeNewProxy:           NewProxy{},
-		TypeNewProxyResp:       NewProxyResp{},
-		TypeCloseProxy:         CloseProxy{},
-		TypeNewWorkConn:        NewWorkConn{},
-		TypeReqWorkConn:        ReqWorkConn{},
-		TypeStartWorkConn:      StartWorkConn{},
-		TypeNewVisitorConn:     NewVisitorConn{},
-		TypeNewVisitorConnResp: NewVisitorConnResp{},
-		TypePing:               Ping{},
-		TypePong:               Pong{},
-		TypeUdpPacket:          UdpPacket{},
-		TypeNatHoleVisitor:     NatHoleVisitor{},
-		TypeNatHoleClient:      NatHoleClient{},
-		TypeNatHoleResp:        NatHoleResp{},
-		TypeNatHoleSid:         NatHoleSid{},
+		TypeLogin:                 Login{},
+		TypeLoginResp:             LoginResp{},
+		TypeNewProxy:              NewProxy{},
+		TypeNewProxyResp:          NewProxyResp{},
+		TypeCloseProxy:            CloseProxy{},
+		TypeNewWorkConn:           NewWorkConn{},
+		TypeReqWorkConn:           ReqWorkConn{},
+		TypeStartWorkConn:         StartWorkConn{},
+		TypeNewVisitorConn:        NewVisitorConn{},
+		TypeNewVisitorConnResp:    NewVisitorConnResp{},
+		TypePing:                  Ping{},
+		TypePong:                  Pong{},
+		TypeUdpPacket:             UdpPacket{},
+		TypeNatHoleVisitor:        NatHoleVisitor{},
+		TypeNatHoleClient:         NatHoleClient{},
+		TypeNatHoleResp:           NatHoleResp{},
+		TypeNatHoleClientDetectOK: NatHoleClientDetectOK{},
+		TypeNatHoleSid:            NatHoleSid{},
 	}
 )
 
@@ -86,17 +88,20 @@ type NewProxy struct {
 	ProxyType      string `json:"proxy_type"`
 	UseEncryption  bool   `json:"use_encryption"`
 	UseCompression bool   `json:"use_compression"`
+	Group          string `json:"group"`
+	GroupKey       string `json:"group_key"`
 
 	// tcp and udp only
 	RemotePort int `json:"remote_port"`
 
 	// http and https only
-	CustomDomains     []string `json:"custom_domains"`
-	SubDomain         string   `json:"subdomain"`
-	Locations         []string `json:"locations"`
-	HostHeaderRewrite string   `json:"host_header_rewrite"`
-	HttpUser          string   `json:"http_user"`
-	HttpPwd           string   `json:"http_pwd"`
+	CustomDomains     []string          `json:"custom_domains"`
+	SubDomain         string            `json:"subdomain"`
+	Locations         []string          `json:"locations"`
+	HttpUser          string            `json:"http_user"`
+	HttpPwd           string            `json:"http_pwd"`
+	HostHeaderRewrite string            `json:"host_header_rewrite"`
+	Headers           map[string]string `json:"headers"`
 
 	// stcp
 	Sk string `json:"sk"`
@@ -121,6 +126,10 @@ type ReqWorkConn struct {
 
 type StartWorkConn struct {
 	ProxyName string `json:"proxy_name"`
+	SrcAddr   string `json:"src_addr"`
+	DstAddr   string `json:"dst_addr"`
+	SrcPort   uint16 `json:"src_port"`
+	DstPort   uint16 `json:"dst_port"`
 }
 
 type NewVisitorConn struct {
@@ -164,6 +173,9 @@ type NatHoleResp struct {
 	VisitorAddr string `json:"visitor_addr"`
 	ClientAddr  string `json:"client_addr"`
 	Error       string `json:"error"`
+}
+
+type NatHoleClientDetectOK struct {
 }
 
 type NatHoleSid struct {

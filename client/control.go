@@ -15,39 +15,34 @@
 package client
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
 
-	"github.com/fatedier/frp/g"
+	"github.com/fatedier/frp/client/proxy"
 	"github.com/fatedier/frp/models/config"
 	"github.com/fatedier/frp/models/msg"
 	"github.com/fatedier/frp/utils/log"
 	frpNet "github.com/fatedier/frp/utils/net"
-	"github.com/fatedier/frp/utils/util"
-	"github.com/fatedier/frp/utils/version"
 
 	"github.com/fatedier/golib/control/shutdown"
 	"github.com/fatedier/golib/crypto"
 	fmux "github.com/hashicorp/yamux"
 )
 
-const (
-	connReadTimeout time.Duration = 10 * time.Second
-)
-
 type Control struct {
-	// frpc service
-	svr *Service
+	// uniq id got from frps, attach it in loginMsg
+	runId string
 
-	// login message to server, only used
-	loginMsg *msg.Login
+	// manage all proxies
+	pxyCfgs map[string]config.ProxyConf
+	pm      *proxy.ProxyManager
 
-	pm *ProxyManager
+	// manage all visitors
+	vm *VisitorManager
 
 	// control connection
 	conn frpNet.Conn
@@ -61,75 +56,64 @@ type Control struct {
 	// read from this channel to get the next message sent by server
 	readCh chan (msg.Message)
 
-	// run id got from server
-	runId string
-
-	// if we call close() in control, do not reconnect to server
-	exit bool
-
 	// goroutines can block by reading from this channel, it will be closed only in reader() when control connection is closed
-	closedCh chan int
+	closedCh chan struct{}
+
+	closedDoneCh chan struct{}
 
 	// last time got the Pong message
 	lastPong time.Time
 
+	// The client configuration
+	clientCfg config.ClientCommonConf
+
 	readerShutdown     *shutdown.Shutdown
 	writerShutdown     *shutdown.Shutdown
 	msgHandlerShutdown *shutdown.Shutdown
+
+	// The UDP port that the server is listening on
+	serverUDPPort int
 
 	mu sync.RWMutex
 
 	log.Logger
 }
 
-func NewControl(svr *Service, pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.ProxyConf) *Control {
-	loginMsg := &msg.Login{
-		Arch:      runtime.GOARCH,
-		Os:        runtime.GOOS,
-		PoolCount: g.GlbClientCfg.PoolCount,
-		User:      g.GlbClientCfg.User,
-		Version:   version.Full(),
-	}
+func NewControl(runId string, conn frpNet.Conn, session *fmux.Session, clientCfg config.ClientCommonConf,
+	pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf, serverUDPPort int) *Control {
+
 	ctl := &Control{
-		svr:                svr,
-		loginMsg:           loginMsg,
+		runId:              runId,
+		conn:               conn,
+		session:            session,
+		pxyCfgs:            pxyCfgs,
 		sendCh:             make(chan msg.Message, 100),
 		readCh:             make(chan msg.Message, 100),
-		closedCh:           make(chan int),
+		closedCh:           make(chan struct{}),
+		closedDoneCh:       make(chan struct{}),
+		clientCfg:          clientCfg,
 		readerShutdown:     shutdown.New(),
 		writerShutdown:     shutdown.New(),
 		msgHandlerShutdown: shutdown.New(),
+		serverUDPPort:      serverUDPPort,
 		Logger:             log.NewPrefixLogger(""),
 	}
-	ctl.pm = NewProxyManager(ctl, ctl.sendCh, "")
-	ctl.pm.Reload(pxyCfgs, visitorCfgs, false)
+	ctl.pm = proxy.NewProxyManager(ctl.sendCh, runId, clientCfg, serverUDPPort)
+
+	ctl.vm = NewVisitorManager(ctl)
+	ctl.vm.Reload(visitorCfgs)
 	return ctl
 }
 
-func (ctl *Control) Run() (err error) {
-	for {
-		err = ctl.login()
-		if err != nil {
-			ctl.Warn("login to server failed: %v", err)
-
-			// if login_fail_exit is true, just exit this program
-			// otherwise sleep a while and continues relogin to server
-			if g.GlbClientCfg.LoginFailExit {
-				return
-			} else {
-				time.Sleep(10 * time.Second)
-			}
-		} else {
-			break
-		}
-	}
-
+func (ctl *Control) Run() {
 	go ctl.worker()
 
-	// start all local visitors and send NewProxy message for all configured proxies
-	ctl.pm.Reset(ctl.sendCh, ctl.runId)
-	ctl.pm.CheckAndStartProxy([]string{ProxyStatusNew})
-	return nil
+	// start all proxies
+	ctl.pm.Reload(ctl.pxyCfgs)
+
+	// start all visitors
+	go ctl.vm.Run()
+	return
 }
 
 func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
@@ -156,7 +140,7 @@ func (ctl *Control) HandleReqWorkConn(inMsg *msg.ReqWorkConn) {
 	workConn.AddLogPrefix(startMsg.ProxyName)
 
 	// dispatch this work connection to related proxy
-	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn)
+	ctl.pm.HandleWorkConn(startMsg.ProxyName, workConn, &startMsg)
 }
 
 func (ctl *Control) HandleNewProxyResp(inMsg *msg.NewProxyResp) {
@@ -171,84 +155,22 @@ func (ctl *Control) HandleNewProxyResp(inMsg *msg.NewProxyResp) {
 }
 
 func (ctl *Control) Close() error {
-	ctl.mu.Lock()
-	defer ctl.mu.Unlock()
-	ctl.exit = true
-	ctl.pm.CloseProxies()
-	return nil
-}
-
-// login send a login message to server and wait for a loginResp message.
-func (ctl *Control) login() (err error) {
-	if ctl.conn != nil {
-		ctl.conn.Close()
-	}
+	ctl.pm.Close()
+	ctl.conn.Close()
 	if ctl.session != nil {
 		ctl.session.Close()
 	}
-
-	conn, err := frpNet.ConnectServerByProxy(g.GlbClientCfg.HttpProxy, g.GlbClientCfg.Protocol,
-		fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, g.GlbClientCfg.ServerPort))
-	if err != nil {
-		return err
-	}
-
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
-
-	if g.GlbClientCfg.TcpMux {
-		fmuxCfg := fmux.DefaultConfig()
-		fmuxCfg.LogOutput = ioutil.Discard
-		session, errRet := fmux.Client(conn, fmuxCfg)
-		if errRet != nil {
-			return errRet
-		}
-		stream, errRet := session.OpenStream()
-		if errRet != nil {
-			session.Close()
-			return errRet
-		}
-		conn = frpNet.WrapConn(stream)
-		ctl.session = session
-	}
-
-	now := time.Now().Unix()
-	ctl.loginMsg.PrivilegeKey = util.GetAuthKey(g.GlbClientCfg.Token, now)
-	ctl.loginMsg.Timestamp = now
-	ctl.loginMsg.RunId = ctl.runId
-
-	if err = msg.WriteMsg(conn, ctl.loginMsg); err != nil {
-		return err
-	}
-
-	var loginRespMsg msg.LoginResp
-	conn.SetReadDeadline(time.Now().Add(connReadTimeout))
-	if err = msg.ReadMsgInto(conn, &loginRespMsg); err != nil {
-		return err
-	}
-	conn.SetReadDeadline(time.Time{})
-
-	if loginRespMsg.Error != "" {
-		err = fmt.Errorf("%s", loginRespMsg.Error)
-		ctl.Error("%s", loginRespMsg.Error)
-		return err
-	}
-
-	ctl.conn = conn
-	// update runId got from server
-	ctl.runId = loginRespMsg.RunId
-	g.GlbClientCfg.ServerUdpPort = loginRespMsg.ServerUdpPort
-	ctl.ClearLogPrefix()
-	ctl.AddLogPrefix(loginRespMsg.RunId)
-	ctl.Info("login to server success, get run id [%s], server udp port [%d]", loginRespMsg.RunId, loginRespMsg.ServerUdpPort)
 	return nil
 }
 
+// ClosedDoneCh returns a channel which will be closed after all resources are released
+func (ctl *Control) ClosedDoneCh() <-chan struct{} {
+	return ctl.closedDoneCh
+}
+
+// connectServer return a new connection to frps
 func (ctl *Control) connectServer() (conn frpNet.Conn, err error) {
-	if g.GlbClientCfg.TcpMux {
+	if ctl.clientCfg.TcpMux {
 		stream, errRet := ctl.session.OpenStream()
 		if errRet != nil {
 			err = errRet
@@ -257,8 +179,14 @@ func (ctl *Control) connectServer() (conn frpNet.Conn, err error) {
 		}
 		conn = frpNet.WrapConn(stream)
 	} else {
-		conn, err = frpNet.ConnectServerByProxy(g.GlbClientCfg.HttpProxy, g.GlbClientCfg.Protocol,
-			fmt.Sprintf("%s:%d", g.GlbClientCfg.ServerAddr, g.GlbClientCfg.ServerPort))
+		var tlsConfig *tls.Config
+		if ctl.clientCfg.TLSEnable {
+			tlsConfig = &tls.Config{
+				InsecureSkipVerify: true,
+			}
+		}
+		conn, err = frpNet.ConnectServerByProxyWithTLS(ctl.clientCfg.HttpProxy, ctl.clientCfg.Protocol,
+			fmt.Sprintf("%s:%d", ctl.clientCfg.ServerAddr, ctl.clientCfg.ServerPort), tlsConfig)
 		if err != nil {
 			ctl.Warn("start new connection to server error: %v", err)
 			return
@@ -278,7 +206,7 @@ func (ctl *Control) reader() {
 	defer ctl.readerShutdown.Done()
 	defer close(ctl.closedCh)
 
-	encReader := crypto.NewReader(ctl.conn, []byte(g.GlbClientCfg.Token))
+	encReader := crypto.NewReader(ctl.conn, []byte(ctl.clientCfg.Token))
 	for {
 		if m, err := msg.ReadMsg(encReader); err != nil {
 			if err == io.EOF {
@@ -286,6 +214,7 @@ func (ctl *Control) reader() {
 				return
 			} else {
 				ctl.Warn("read error: %v", err)
+				ctl.conn.Close()
 				return
 			}
 		} else {
@@ -297,7 +226,7 @@ func (ctl *Control) reader() {
 // writer writes messages got from sendCh to frps
 func (ctl *Control) writer() {
 	defer ctl.writerShutdown.Done()
-	encWriter, err := crypto.NewWriter(ctl.conn, []byte(g.GlbClientCfg.Token))
+	encWriter, err := crypto.NewWriter(ctl.conn, []byte(ctl.clientCfg.Token))
 	if err != nil {
 		ctl.conn.Error("crypto new writer error: %v", err)
 		ctl.conn.Close()
@@ -326,7 +255,7 @@ func (ctl *Control) msgHandler() {
 	}()
 	defer ctl.msgHandlerShutdown.Done()
 
-	hbSend := time.NewTicker(time.Duration(g.GlbClientCfg.HeartBeatInterval) * time.Second)
+	hbSend := time.NewTicker(time.Duration(ctl.clientCfg.HeartBeatInterval) * time.Second)
 	defer hbSend.Stop()
 	hbCheck := time.NewTicker(time.Second)
 	defer hbCheck.Stop()
@@ -340,7 +269,7 @@ func (ctl *Control) msgHandler() {
 			ctl.Debug("send heartbeat to server")
 			ctl.sendCh <- &msg.Ping{}
 		case <-hbCheck.C:
-			if time.Since(ctl.lastPong) > time.Duration(g.GlbClientCfg.HeartBeatTimeout)*time.Second {
+			if time.Since(ctl.lastPong) > time.Duration(ctl.clientCfg.HeartBeatTimeout)*time.Second {
 				ctl.Warn("heartbeat timeout")
 				// let reader() stop
 				ctl.conn.Close()
@@ -364,87 +293,35 @@ func (ctl *Control) msgHandler() {
 	}
 }
 
-// controler keep watching closedCh, start a new connection if previous control connection is closed.
-// If controler is notified by closedCh, reader and writer and handler will exit, then recall these functions.
+// If controler is notified by closedCh, reader and writer and handler will exit
 func (ctl *Control) worker() {
 	go ctl.msgHandler()
 	go ctl.reader()
 	go ctl.writer()
 
-	var err error
-	maxDelayTime := 20 * time.Second
-	delayTime := time.Second
+	select {
+	case <-ctl.closedCh:
+		// close related channels and wait until other goroutines done
+		close(ctl.readCh)
+		ctl.readerShutdown.WaitDone()
+		ctl.msgHandlerShutdown.WaitDone()
 
-	checkInterval := 60 * time.Second
-	checkProxyTicker := time.NewTicker(checkInterval)
-	for {
-		select {
-		case <-checkProxyTicker.C:
-			// check which proxy registered failed and reregister it to server
-			ctl.pm.CheckAndStartProxy([]string{ProxyStatusStartErr, ProxyStatusClosed})
-		case _, ok := <-ctl.closedCh:
-			// we won't get any variable from this channel
-			if !ok {
-				// close related channels and wait until other goroutines done
-				close(ctl.readCh)
-				ctl.readerShutdown.WaitDone()
-				ctl.msgHandlerShutdown.WaitDone()
+		close(ctl.sendCh)
+		ctl.writerShutdown.WaitDone()
 
-				close(ctl.sendCh)
-				ctl.writerShutdown.WaitDone()
+		ctl.pm.Close()
+		ctl.vm.Close()
 
-				ctl.pm.CloseProxies()
-				// if ctl.exit is true, just exit
-				ctl.mu.RLock()
-				exit := ctl.exit
-				ctl.mu.RUnlock()
-				if exit {
-					return
-				}
-
-				// loop util reconnecting to server success
-				for {
-					ctl.Info("try to reconnect to server...")
-					err = ctl.login()
-					if err != nil {
-						ctl.Warn("reconnect to server error: %v", err)
-						time.Sleep(delayTime)
-						delayTime = delayTime * 2
-						if delayTime > maxDelayTime {
-							delayTime = maxDelayTime
-						}
-						continue
-					}
-					// reconnect success, init delayTime
-					delayTime = time.Second
-					break
-				}
-
-				// init related channels and variables
-				ctl.sendCh = make(chan msg.Message, 100)
-				ctl.readCh = make(chan msg.Message, 100)
-				ctl.closedCh = make(chan int)
-				ctl.readerShutdown = shutdown.New()
-				ctl.writerShutdown = shutdown.New()
-				ctl.msgHandlerShutdown = shutdown.New()
-				ctl.pm.Reset(ctl.sendCh, ctl.runId)
-
-				// previous work goroutines should be closed and start them here
-				go ctl.msgHandler()
-				go ctl.writer()
-				go ctl.reader()
-
-				// start all configured proxies
-				ctl.pm.CheckAndStartProxy([]string{ProxyStatusNew, ProxyStatusClosed})
-
-				checkProxyTicker.Stop()
-				checkProxyTicker = time.NewTicker(checkInterval)
-			}
+		close(ctl.closedDoneCh)
+		if ctl.session != nil {
+			ctl.session.Close()
 		}
+		return
 	}
 }
 
-func (ctl *Control) reloadConf(pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.ProxyConf) error {
-	err := ctl.pm.Reload(pxyCfgs, visitorCfgs, true)
-	return err
+func (ctl *Control) ReloadConf(pxyCfgs map[string]config.ProxyConf, visitorCfgs map[string]config.VisitorConf) error {
+	ctl.vm.Reload(visitorCfgs)
+	ctl.pm.Reload(pxyCfgs)
+	return nil
 }
